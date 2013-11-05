@@ -234,7 +234,8 @@ static void parse_all_cus(struct reader r, void (*action)(struct cu_ctx *cu, voi
 static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint64_t offset, bool *must_free_p, size_t *sizep) {
     // i should probably have a string library.
     kvec_t(char) prefix = {0}, suffix = {0};
-    char *base;
+    char *base = NULL;
+    bool free_base = false;
     bool first = true;
     while(1) {
         cu->r = reader_slice_to_end(cu->full_r, offset);
@@ -245,15 +246,20 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
             first = false;
         }
         if(!(node.flag & (1 << AFL_TYPE))) {
-            if(node.flag & (1 << AFL_SPECIFICATION)) {
-                // get a better name
-                offset = node.at_specification;
-                continue;
-            }
             khiter_t k = kh_get(ccp, name_map, offset);
             if(k != kh_end(name_map))
                 base = (char *) kh_value(name_map, k);
-            else
+            if(node.flag & (1 << AFL_SPECIFICATION)) {
+                offset = node.at_specification;
+                continue;
+            }
+            if(!base && (node.flag & (1 << AFL_NAME))) {
+                // this isn't good because it lacks a namespace - why don't we
+                // have a name?
+                asprintf(&base, "??::%s", node.at_name);
+                free_base = true;
+            }
+            if(!base)
                 base = "?";
             break;
         }
@@ -312,7 +318,7 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
         }
     }
     if(kv_size(prefix) == 0 && kv_size(suffix) == 0) {
-        *must_free_p = false;
+        *must_free_p = free_base;
         return base;
     }
     kvec_t(char) result = {0};
@@ -323,6 +329,7 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
     kv_insert_a(char, result, kv_size(result), suffix.a, kv_size(suffix));
     kv_push(char, result, '\0');
     *must_free_p = true;
+    if(free_base) free(base);
     return result.a;
 }
 
