@@ -384,6 +384,10 @@ static void die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_n
             switch(subnode.tag) {
             case DW_TAG_member:
             case DW_TAG_inheritance: {
+                if(!(subnode.flag & (1 << AFL_DATA_MEMBER_LOCATION))) {
+                    // static or something
+                    break;
+                }
                 bool free_typename;
                 size_t size;
                 char *typename = get_full_type_name(cu, name_map, subnode.at_type, &free_typename, &size);
@@ -391,13 +395,11 @@ static void die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_n
                 tjson_dict_start(tj);
                     tjson_dict_key(tj, "name");
                     tjson_str(tj, name);
-                    if(subnode.flag & (1 << AFL_DATA_MEMBER_LOCATION)) {
-                        uint64_t offset = loc_to_offset(subnode.at_data_member_location);
+                    uint64_t offset = loc_to_offset(subnode.at_data_member_location);
 
-                        if(offset != -1) {
-                            tjson_dict_key(tj, "offset");
-                            tjson_num(tj, offset);
-                        }
+                    if(offset != -1) {
+                        tjson_dict_key(tj, "offset");
+                        tjson_num(tj, offset);
                     }
                     if(size != -1) {
                         tjson_dict_key(tj, "size");
