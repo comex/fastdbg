@@ -244,7 +244,7 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
             *sizep = (node.flag & (1 << AFL_BYTE_SIZE)) ? node.at_byte_size : -1;
             first = false;
         }
-        if(!(node.flag & (1 << AFL_TYPE)) || node.tag == DW_TAG_typedef) {
+        if(!(node.flag & (1 << AFL_TYPE))) {
             if(node.flag & (1 << AFL_SPECIFICATION)) {
                 // get a better name
                 offset = node.at_specification;
@@ -266,6 +266,8 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
         switch(node.tag) {
         case DW_TAG_const_type:
         case DW_TAG_volatile_type:
+        case DW_TAG_typedef:
+            first = true;
             break;
         case DW_TAG_pointer_type:
             kv_push(char, prefix, '*');
