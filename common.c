@@ -1,5 +1,11 @@
 #include "common.h"
 
+void set_block_buffered(FILE *fp) {
+    size_t size = 100000;
+    char *buf = malloc(size);
+    setbuffer(stdout, buf, size);
+}
+
 uint64_t read_leb128_rest(struct reader *r, bool is_signed) {
     uint64_t result = 0;
     int shift;
@@ -21,6 +27,7 @@ void tjson_newline(struct tjson *tj) {
 }
 
 void tjson_str(struct tjson *tj, const char *str) {
+    _tjson_item(tj);
     _putc('"', tj->fp);
     // this ignores control characters, in case anyone cares
     unsigned char c;

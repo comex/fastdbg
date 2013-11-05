@@ -5,6 +5,7 @@
     'vtable': {offset: name...},
     'members': [{
         'offset', 'size', 'type', 'name'
+        # size is needed because the type might not be a class/struct/typedef
     }...]
 }...}
 */
@@ -15,28 +16,41 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include "klib/kvec.h"
 
 #define UNUSED __attribute__((unused))
 
+void set_block_buffered(FILE *fp);
+
 // https://github.com/attractivechaos/klib/issues/16 - seriously?
 // also zeroes
-#include "klib/kvec.h"
 struct kvec_generic {
     size_t n, m;
     void *a;
 };
-static inline void kv_ensure_size(struct kvec_generic *kv, size_t esize, size_t i) {
-    if(i >= kv->m) {
+static inline void kv_ensure_size_generic(struct kvec_generic *kv, size_t esize, size_t i) {
+    if(i > kv->m) {
         size_t oldm = kv->m;
-        kv->n = kv->m = i + 1;
+        kv->n = kv->m = i;
         kv_roundup32(kv->m);
         kv->a = realloc(kv->a, esize * kv->m);
         memset(kv->a + esize * oldm, 0, esize * (kv->m - oldm));
-    } else if(i >= kv->n) {
-        kv->n = i + 1;
+    } else if(i > kv->n) {
+        kv->n = i;
     }
 }
-#define kv_ap(type, v, i) (kv_ensure_size((struct kvec_generic *) &(v), sizeof(type), i), &kv_A(v, i))
+#define kv_ap(type, v, i) (kv_ensure_size_generic((struct kvec_generic *) &(v), sizeof(type), (i) + 1), &kv_A(v, i))
+
+static inline void kv_insert_a_generic(struct kvec_generic *kv, size_t esize, size_t i, const void *ptr, size_t n) {
+    size_t kn = kv->n;
+    kv_ensure_size_generic(kv, esize, kn + n);
+    if(kn != i)
+        memmove(kv->a + esize * i + esize * n, kv->a + esize * i, esize * (kn - i));
+    memcpy(kv->a + esize * i, ptr, esize * n);
+}
+
+// useful for treating a kvec as a char
+#define kv_insert_a(type, v, i, p, n) kv_insert_a_generic((struct kvec_generic *) &(v), sizeof(type), i, p, n)
 
 #define panic(msg...) do { fprintf(stderr, msg); abort(); } while(0)
 
@@ -85,22 +99,20 @@ struct tjson {
     FILE *fp;
     size_t indent;
     bool haditem;
+    bool not_in_line;
 };
 
 #define _putc putc_unlocked
 
 void tjson_newline(struct tjson *tj);
 void tjson_str(struct tjson *tj, const char *str);
-static inline void tjson_list_start(struct tjson *tj) {
-    _putc('[', tj->fp);
-    tj->indent++;
-    tj->haditem = false;
-}
-static inline void tjson_list_item(struct tjson *tj) {
-    if (tj->haditem)
+static inline void _tjson_item(struct tjson *tj) {
+    if(tj->haditem)
         _putc(',', tj->fp);
-    tjson_newline(tj);
+    if(tj->not_in_line)
+        tjson_newline(tj);
     tj->haditem = true;
+    tj->not_in_line = true;
 }
 static inline void _tjson_x_end(struct tjson *tj) {
     tj->indent--;
@@ -108,19 +120,32 @@ static inline void _tjson_x_end(struct tjson *tj) {
         tjson_newline(tj);
     tj->haditem = true;
 }
+
+static inline void tjson_num(struct tjson *tj, int64_t i) {
+    _tjson_item(tj);
+    fprintf(tj->fp, "%lld", i);
+}
+static inline void tjson_list_start(struct tjson *tj) {
+    _tjson_item(tj);
+    _putc('[', tj->fp);
+    tj->indent++;
+    tj->haditem = false;
+}
 static inline void tjson_list_end(struct tjson *tj) {
     _tjson_x_end(tj);
     _putc(']', tj->fp);
 }
 static inline void tjson_dict_start(struct tjson *tj) {
+    _tjson_item(tj);
     _putc('{', tj->fp);
     tj->indent++;
     tj->haditem = false;
 }
 static inline void tjson_dict_key(struct tjson *tj, const char *name) {
-    tjson_list_item(tj);
     tjson_str(tj, name);
     fputs(": ", tj->fp);
+    tj->haditem = false;
+    tj->not_in_line = false;
 }
 static inline void tjson_dict_end(struct tjson *tj) {
     _tjson_x_end(tj);
