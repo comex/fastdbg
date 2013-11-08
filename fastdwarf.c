@@ -11,10 +11,228 @@
 #include <fcntl.h>
 #include "safe-math.h"
 #include "elf.h"
-#include "dwarf2.h"
 #include "common.h"
 #include "klib/kvec.h"
 #include "klib/khash.h"
+
+/* '<,'>s!\([A-Z][^ ]*\)  *=  *\([^, ]*\).*!x(\1, \2) \ */
+#define enum_dwarf_tag(x) \
+    x(DW_TAG_padding, 0x00) \
+    x(DW_TAG_array_type, 0x01) \
+    x(DW_TAG_class_type, 0x02) \
+    x(DW_TAG_entry_point, 0x03) \
+    x(DW_TAG_enumeration_type, 0x04) \
+    x(DW_TAG_formal_parameter, 0x05) \
+    x(DW_TAG_imported_declaration, 0x08) \
+    x(DW_TAG_label, 0x0a) \
+    x(DW_TAG_lexical_block, 0x0b) \
+    x(DW_TAG_member, 0x0d) \
+    x(DW_TAG_pointer_type, 0x0f) \
+    x(DW_TAG_reference_type, 0x10) \
+    x(DW_TAG_compile_unit, 0x11) \
+    x(DW_TAG_string_type, 0x12) \
+    x(DW_TAG_structure_type, 0x13) \
+    x(DW_TAG_subroutine_type, 0x15) \
+    x(DW_TAG_typedef, 0x16) \
+    x(DW_TAG_union_type, 0x17) \
+    x(DW_TAG_unspecified_parameters, 0x18) \
+    x(DW_TAG_variant, 0x19) \
+    x(DW_TAG_common_block, 0x1a) \
+    x(DW_TAG_common_inclusion, 0x1b) \
+    x(DW_TAG_inheritance, 0x1c) \
+    x(DW_TAG_inlined_subroutine, 0x1d) \
+    x(DW_TAG_module, 0x1e) \
+    x(DW_TAG_ptr_to_member_type, 0x1f) \
+    x(DW_TAG_set_type, 0x20) \
+    x(DW_TAG_subrange_type, 0x21) \
+    x(DW_TAG_with_stmt, 0x22) \
+    x(DW_TAG_access_declaration, 0x23) \
+    x(DW_TAG_base_type, 0x24) \
+    x(DW_TAG_catch_block, 0x25) \
+    x(DW_TAG_const_type, 0x26) \
+    x(DW_TAG_constant, 0x27) \
+    x(DW_TAG_enumerator, 0x28) \
+    x(DW_TAG_file_type, 0x29) \
+    x(DW_TAG_friend, 0x2a) \
+    x(DW_TAG_namelist, 0x2b) \
+    x(DW_TAG_namelist_item, 0x2c) \
+    x(DW_TAG_packed_type, 0x2d) \
+    x(DW_TAG_subprogram, 0x2e) \
+    x(DW_TAG_template_type_param, 0x2f) \
+    x(DW_TAG_template_value_param, 0x30) \
+    x(DW_TAG_thrown_type, 0x31) \
+    x(DW_TAG_try_block, 0x32) \
+    x(DW_TAG_variant_part, 0x33) \
+    x(DW_TAG_variable, 0x34) \
+    x(DW_TAG_volatile_type, 0x35) \
+    x(DW_TAG_dwarf_procedure, 0x36) \
+    x(DW_TAG_restrict_type, 0x37) \
+    x(DW_TAG_interface_type, 0x38) \
+    x(DW_TAG_namespace, 0x39) \
+    x(DW_TAG_imported_module, 0x3a) \
+    x(DW_TAG_unspecified_type, 0x3b) \
+    x(DW_TAG_partial_unit, 0x3c) \
+    x(DW_TAG_imported_unit, 0x3d) \
+    x(DW_TAG_condition, 0x3f) \
+    x(DW_TAG_shared_type, 0x40) \
+    x(DW_TAG_format_label, 0x4101) \
+    x(DW_TAG_function_template, 0x4102) \
+    x(DW_TAG_class_template, 0x4103) \
+    x(DW_TAG_GNU_BINCL, 0x4104) \
+    x(DW_TAG_GNU_EINCL, 0x4105)
+
+#define enum_dwarf_form(x) \
+    x(DW_FORM_addr, 0x01) \
+    x(DW_FORM_block2, 0x03) \
+    x(DW_FORM_block4, 0x04) \
+    x(DW_FORM_data2, 0x05) \
+    x(DW_FORM_data4, 0x06) \
+    x(DW_FORM_data8, 0x07) \
+    x(DW_FORM_string, 0x08) \
+    x(DW_FORM_block, 0x09) \
+    x(DW_FORM_block1, 0x0a) \
+    x(DW_FORM_data1, 0x0b) \
+    x(DW_FORM_flag, 0x0c) \
+    x(DW_FORM_sdata, 0x0d) \
+    x(DW_FORM_strp, 0x0e) \
+    x(DW_FORM_udata, 0x0f) \
+    x(DW_FORM_ref_addr, 0x10) \
+    x(DW_FORM_ref1, 0x11) \
+    x(DW_FORM_ref2, 0x12) \
+    x(DW_FORM_ref4, 0x13) \
+    x(DW_FORM_ref8, 0x14) \
+    x(DW_FORM_ref_udata, 0x15) \
+    x(DW_FORM_indirect, 0x16) \
+    x(DW_FORM_secoffset, 0x17) \
+    x(DW_FORM_exprloc, 0x18) \
+    x(DW_FORM_flag_present, 0x19) \
+    x(DW_FORM_ref_sig8, 0x20)
+
+#define enum_dwarf_at(x) \
+    x(DW_AT_sibling, 0x01) \
+    x(DW_AT_location, 0x02) \
+    x(DW_AT_name, 0x03) \
+    x(DW_AT_ordering, 0x09) \
+    x(DW_AT_subscr_data, 0x0a) \
+    x(DW_AT_byte_size, 0x0b) \
+    x(DW_AT_bit_offset, 0x0c) \
+    x(DW_AT_bit_size, 0x0d) \
+    x(DW_AT_element_list, 0x0f) \
+    x(DW_AT_stmt_list, 0x10) \
+    x(DW_AT_low_pc, 0x11) \
+    x(DW_AT_high_pc, 0x12) \
+    x(DW_AT_language, 0x13) \
+    x(DW_AT_member, 0x14) \
+    x(DW_AT_discr, 0x15) \
+    x(DW_AT_discr_value, 0x16) \
+    x(DW_AT_visibility, 0x17) \
+    x(DW_AT_import, 0x18) \
+    x(DW_AT_string_length, 0x19) \
+    x(DW_AT_common_reference, 0x1a) \
+    x(DW_AT_comp_dir, 0x1b) \
+    x(DW_AT_const_value, 0x1c) \
+    x(DW_AT_containing_type, 0x1d) \
+    x(DW_AT_default_value, 0x1e) \
+    x(DW_AT_inline, 0x20) \
+    x(DW_AT_is_optional, 0x21) \
+    x(DW_AT_lower_bound, 0x22) \
+    x(DW_AT_producer, 0x25) \
+    x(DW_AT_prototyped, 0x27) \
+    x(DW_AT_return_addr, 0x2a) \
+    x(DW_AT_start_scope, 0x2c) \
+    x(DW_AT_stride_size, 0x2e) \
+    x(DW_AT_upper_bound, 0x2f) \
+    x(DW_AT_abstract_origin, 0x31) \
+    x(DW_AT_accessibility, 0x32) \
+    x(DW_AT_address_class, 0x33) \
+    x(DW_AT_artificial, 0x34) \
+    x(DW_AT_base_types, 0x35) \
+    x(DW_AT_calling_convention, 0x36) \
+    x(DW_AT_count, 0x37) \
+    x(DW_AT_data_member_location, 0x38) \
+    x(DW_AT_decl_column, 0x39) \
+    x(DW_AT_decl_file, 0x3a) \
+    x(DW_AT_decl_line, 0x3b) \
+    x(DW_AT_declaration, 0x3c) \
+    x(DW_AT_discr_list, 0x3d) \
+    x(DW_AT_encoding, 0x3e) \
+    x(DW_AT_external, 0x3f) \
+    x(DW_AT_frame_base, 0x40) \
+    x(DW_AT_friend, 0x41) \
+    x(DW_AT_identifier_case, 0x42) \
+    x(DW_AT_macro_info, 0x43) \
+    x(DW_AT_namelist_items, 0x44) \
+    x(DW_AT_priority, 0x45) \
+    x(DW_AT_segment, 0x46) \
+    x(DW_AT_specification, 0x47) \
+    x(DW_AT_static_link, 0x48) \
+    x(DW_AT_type, 0x49) \
+    x(DW_AT_use_location, 0x4a) \
+    x(DW_AT_variable_parameter, 0x4b) \
+    x(DW_AT_virtuality, 0x4c) \
+    x(DW_AT_vtable_elem_location, 0x4d) \
+    x(DW_AT_allocated, 0x4e) \
+    x(DW_AT_associated, 0x4f) \
+    x(DW_AT_data_location, 0x50) \
+    x(DW_AT_stride, 0x51) \
+    x(DW_AT_entry_pc, 0x52) \
+    x(DW_AT_use_UTF8, 0x53) \
+    x(DW_AT_extension, 0x54) \
+    x(DW_AT_ranges, 0x55) \
+    x(DW_AT_trampoline, 0x56) \
+    x(DW_AT_call_column, 0x57) \
+    x(DW_AT_call_file, 0x58) \
+    x(DW_AT_call_line, 0x59) \
+    x(DW_AT_description, 0x5a) \
+    x(DW_AT_binary_scale, 0x5b) \
+    x(DW_AT_decimal_scale, 0x5c) \
+    x(DW_AT_small, 0x5d) \
+    x(DW_AT_decimal_sign, 0x5e) \
+    x(DW_AT_digit_count, 0x5f) \
+    x(DW_AT_picture_string, 0x60) \
+    x(DW_AT_mutable, 0x61) \
+    x(DW_AT_threads_scaled, 0x62) \
+    x(DW_AT_explicit, 0x63) \
+    x(DW_AT_object_pointer, 0x64) \
+    x(DW_AT_endianity, 0x65) \
+    x(DW_AT_elemental, 0x66) \
+    x(DW_AT_pure, 0x67) \
+    x(DW_AT_recursive, 0x68) \
+    x(DW_AT_sf_names, 0x2101) \
+    x(DW_AT_src_info, 0x2102) \
+    x(DW_AT_mac_info, 0x2103) \
+    x(DW_AT_src_coords, 0x2104) \
+    x(DW_AT_body_begin, 0x2105) \
+    x(DW_AT_body_end, 0x2106) \
+    x(DW_AT_GNU_vector, 0x2107)
+
+enum {
+    DW_OP_constu = 0x10,
+    DW_OP_plus_uconst = 0x23,
+};
+
+#define _ENUM_ENTRY(name, val) name = val,
+#define _ENUM_GETNAME(name, val) case name: return &#name[skip];
+#define DEFINE_ENUM(c, name, prefix) \
+    enum { \
+        c(_ENUM_ENTRY) \
+    }; \
+    static const char *name##_name(uint64_t val) { \
+        int skip = sizeof(prefix) - 1; \
+        static char unkbuf[64]; \
+        switch(val) { \
+            c(_ENUM_GETNAME) \
+            default: \
+                sprintf(unkbuf, "<unknown %llx>", val); \
+                return unkbuf; \
+        } \
+    }
+
+DEFINE_ENUM(enum_dwarf_tag, dwarf_tag, "DW_TAG_")
+DEFINE_ENUM(enum_dwarf_form, dwarf_form, "DW_FORM_")
+DEFINE_ENUM(enum_dwarf_at, dwarf_at, "DW_AT_")
+
+#define FORM_DATA_AS_LOCATION 0x80
 
 enum {
     AFL_NAME,
@@ -23,21 +241,29 @@ enum {
     AFL_SIBLING,
     AFL_BYTE_SIZE,
     AFL_DATA_MEMBER_LOCATION,
-    AFL_VTABLE_ELEM_LOCATION
+    AFL_VTABLE_ELEM_LOCATION,
+};
+
+struct dwarf_location {
+    union {
+        struct reader r;
+        uint64_t constant;
+    };
+    bool is_constant;
 };
 
 struct dwarf_node {
-    uint64_t tag;
+    uint32_t tag;
     bool has_children;
+    uint32_t flag;
     uint64_t uid;
-    uint64_t flag;
     const char *at_name;
     uint64_t at_type;
     uint64_t at_specification;
     uint64_t at_sibling;
     uint64_t at_byte_size;
-    struct reader at_data_member_location;
-    struct reader at_vtable_elem_location;
+    struct dwarf_location at_data_member_location;
+    struct dwarf_location at_vtable_elem_location;
 };
 
 struct dwarf_cached_attr {
@@ -47,10 +273,10 @@ struct dwarf_cached_attr {
 };
 
 struct dwarf_abbr {
-    uint64_t tag;
+    uint32_t tag;
     bool has_children;
     struct dwarf_cached_attr *attrs;
-    uint8_t flag;
+    uint32_t flag;
 };
 
 struct dwarf_abbr_cu {
@@ -64,6 +290,9 @@ struct cu_ctx {
     int addr_bytes;
     // debug_info
     struct dwarf_abbr_cu *acu;
+    // debug_types
+    uint64_t type_signature;
+    uint64_t type_offset;
 
 };
 
@@ -100,6 +329,87 @@ static uint64_t read_addr(struct cu_ctx *cu) {
     return cu->addr_bytes == 8 ? read_t(uint64_t, &cu->r) : read_t(uint32_t, &cu->r);
 }
 
+static void parse_attr(struct cu_ctx *cu, uint64_t form, void *p) {
+    struct reader *r = &cu->r;
+    uint64_t blocklen;
+    switch(form & ~FORM_DATA_AS_LOCATION) {
+    case DW_FORM_strp:
+    {
+        //printf("node_offset=%x\n", ca->node_offset);
+        uint64_t debug_str_offset = read_fmtbits(cu);
+        assert(debug_str_offset < debug_str.end - debug_str.ptr);
+        *(const char **) p = debug_str.ptr + debug_str_offset;
+        break;
+    }
+    case DW_FORM_string:
+        *(const char **) p = read_cstr(r).ptr;
+        break;
+
+    case DW_FORM_data1:
+    case DW_FORM_ref1:
+        *(uint64_t *) p = read_t(uint8_t, r);
+        break;
+    case DW_FORM_data2:
+    case DW_FORM_ref2:
+        *(uint64_t *) p = read_t(uint16_t, r);
+        break;
+    case DW_FORM_data4:
+    case DW_FORM_ref4:
+        *(uint64_t *) p = read_t(uint32_t, r);
+        break;
+    case DW_FORM_data8:
+    case DW_FORM_ref_sig8: // we won't even notice
+    case DW_FORM_ref8:
+        *(uint64_t *) p = read_t(uint64_t, r);
+        break;
+    case DW_FORM_udata:
+    case DW_FORM_ref_udata:
+        *(uint64_t *) p = read_uleb128(r);
+        break;
+    case DW_FORM_sdata:
+        *(int64_t *) p = read_sleb128(r);
+        break;
+    case DW_FORM_addr:
+        *(uint64_t *) p = read_addr(cu);
+        break;
+    case DW_FORM_secoffset:
+        *(uint64_t *) p = read_fmtbits(cu);
+        break;
+    case DW_FORM_block1:
+        blocklen = read_t(uint8_t, r);
+        goto block;
+    case DW_FORM_block2:
+        blocklen = read_t(uint16_t, r);
+        goto block;
+    case DW_FORM_block4:
+        blocklen = read_t(uint32_t, r);
+        goto block;
+    case DW_FORM_block:
+    case DW_FORM_exprloc:
+        blocklen = read_uleb128(r);
+        goto block;
+    block: {
+        struct dwarf_location *loc = p;
+        loc->is_constant = false;
+        loc->r.ptr = read_bytes(r, blocklen);
+        loc->r.end = r->ptr;
+        break;
+    }
+    case DW_FORM_flag:
+        *(bool *) p = read_t(uint8_t, r);
+        break;
+    case DW_FORM_flag_present:
+        *(bool *) p = true;
+        break;
+    default:
+        // should have been checked
+        assert(0);
+    }
+    if(form & FORM_DATA_AS_LOCATION) {
+        ((struct dwarf_location *) p)->is_constant = true;
+    }
+}
+
 // return whether there was a node (as opposed to a child end marker)
 static bool parse_die(struct cu_ctx *cu, struct dwarf_node *node) {
     struct reader *r = &cu->r;
@@ -111,86 +421,23 @@ static bool parse_die(struct cu_ctx *cu, struct dwarf_node *node) {
     struct dwarf_abbr *ab;
     if(abbrev >= kv_size(cu->acu->abbrs) ||
        (ab = &kv_A(cu->acu->abbrs, abbrev), !ab->tag))
-        panic("bad abbrev 0x%02llx\n", abbrev);
+        panic("bad abbrev 0x%02llx (we probably got misaligned)\n", abbrev);
     node->uid = r->ptr - entire_file_start;
     node->tag = ab->tag;
     node->has_children = ab->has_children;
     node->flag = ab->flag;
     //printf("abbrev=0x%llx tag=0x%02llx children=%d\n", abbrev, ab->tag, ab->has_children);
     for(struct dwarf_cached_attr *ca = ab->attrs; ca->form; ca++) {
-        char crap[16];
+        char crap[64];
         void *p;
         if(ca->node_offset != 0)
             p = (void *) node + ca->node_offset;
         else
             p = crap;
 
-        uint64_t blocklen;
+        uint64_t form = ca->form;
         //printf("  name=0x%02x form=0x%02x\n", ca->name, ca->form);
-        switch(ca->form) {
-        case DW_FORM_strp:
-        {
-            //printf("node_offset=%x\n", ca->node_offset);
-            uint64_t debug_str_offset = read_fmtbits(cu);
-            assert(debug_str_offset < debug_str.end - debug_str.ptr);
-            *(const char **) p = debug_str.ptr + debug_str_offset;
-            break;
-        }
-        case DW_FORM_string:
-            *(const char **) p = read_cstr(r).ptr;
-            break;
-
-        case DW_FORM_data1:
-        case DW_FORM_ref1:
-            *(uint64_t *) p = read_t(uint8_t, r);
-            break;
-        case DW_FORM_data2:
-        case DW_FORM_ref2:
-            *(uint64_t *) p = read_t(uint16_t, r);
-            break;
-        case DW_FORM_data4:
-        case DW_FORM_ref4:
-            *(uint64_t *) p = read_t(uint32_t, r);
-            break;
-        case DW_FORM_data8:
-        case DW_FORM_ref8:
-            *(uint64_t *) p = read_t(uint64_t, r);
-            break;
-        case DW_FORM_udata:
-        case DW_FORM_ref_udata:
-            *(uint64_t *) p = read_uleb128(r);
-            break;
-        case DW_FORM_sdata:
-            *(int64_t *) p = read_sleb128(r);
-            break;
-        case DW_FORM_addr:
-            *(uint64_t *) p = read_addr(cu);
-            break;
-        case DW_FORM_block1:
-            blocklen = read_t(uint8_t, r);
-            goto block;
-        case DW_FORM_block2:
-            blocklen = read_t(uint16_t, r);
-            goto block;
-        case DW_FORM_block4:
-            blocklen = read_t(uint32_t, r);
-            goto block;
-        case DW_FORM_block:
-            blocklen = read_uleb128(r);
-            goto block;
-        block: {
-            struct reader *pr = p;
-            pr->ptr = read_bytes(r, blocklen); 
-            pr->end = r->ptr;
-            break;
-        }
-        case DW_FORM_flag:
-            *(bool *) p = read_t(uint8_t, r);
-            break;
-        default:
-            // should have been checked
-            assert(0);
-        }
+        parse_attr(cu, form, p);
     }
     return true;
 }
@@ -201,6 +448,11 @@ static void parse_debug_info_header(struct cu_ctx *cu) {
     assert(k != kh_end(&dwarf_abbr_cus));
     cu->acu = &kh_value(&dwarf_abbr_cus, k);
     cu->addr_bytes = read_t(uint8_t, &cu->r);
+}
+
+static void parse_debug_types_header(struct cu_ctx *cu) {
+    cu->type_signature = read_t(uint64_t, &cu->r);
+    cu->type_offset = read_fmtbits(cu);
 }
 
 static void parse_cu_header(struct cu_ctx *cu, struct reader *r) {
@@ -322,7 +574,7 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
             break;
         }
         default:
-            panic("unknown tag 0x%02llx in type\n", node.tag);
+            panic("unknown tag 0x%02x in type\n", node.tag);
         }
     }
     if(kv_size(prefix) == 0 && kv_size(suffix) == 0) {
@@ -345,12 +597,16 @@ end:
     return res;
 }
 
-static uint64_t loc_to_offset(struct reader loc) {
-    uint8_t code = read_t(uint8_t, &loc);
-    if(code == DW_OP_plus_uconst || code == DW_OP_constu)
-        return read_uleb128(&loc);
-    else
-        return -1;
+static uint64_t loc_to_offset(struct dwarf_location loc) {
+    if(loc.is_constant) {
+        return loc.constant;
+    } else {
+        uint8_t code = read_t(uint8_t, &loc.r);
+        if(code == DW_OP_plus_uconst || code == DW_OP_constu)
+            return read_uleb128(&loc.r);
+        else
+            return -1;
+    }
 }
 
 static void struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, const char *myname) {
@@ -577,6 +833,73 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     ec->name_map_needs_mass_free = true;
 }
 
+static void debug_info_cu_dump(struct cu_ctx *restrict cu, void *is_types) {
+    parse_debug_info_header(cu);
+    if(is_types)
+        parse_debug_types_header(cu);
+    int depth = 0;
+    struct reader *r = &cu->r;
+    while(r->ptr != r->end) {
+        uint64_t offset = cu->r.ptr - cu->full_r.ptr;
+        uint64_t abbrev = read_uleb128(&cu->r);
+        if(!abbrev) {
+            assert(--depth >= 0);
+            continue;
+        }
+        struct dwarf_abbr *ab;
+        if(abbrev >= kv_size(cu->acu->abbrs) ||
+           (ab = &kv_A(cu->acu->abbrs, abbrev), !ab->tag))
+            panic("bad abbrev 0x%02llx (we probably got misaligned)\n", abbrev);
+
+        for(int i = 0; i < depth; i++) putchar(' ');
+        printf("[%llx] %s\n", offset, dwarf_tag_name(ab->tag));
+        for(struct dwarf_cached_attr *ca = ab->attrs; ca->form; ca++) {
+            for(int i = 0; i < depth; i++) putchar(' ');
+            printf("  %s: <%s> ", dwarf_at_name(ca->name), dwarf_form_name(ca->form & ~FORM_DATA_AS_LOCATION));
+            char buf[64];
+            parse_attr(cu, ca->form, buf);
+            switch(ca->form & ~FORM_DATA_AS_LOCATION) {
+            case DW_FORM_strp:
+            case DW_FORM_string:
+                printf("\"%s\"", *(const char **) buf);
+                break;
+            case DW_FORM_data1:
+            case DW_FORM_ref1:
+            case DW_FORM_data2:
+            case DW_FORM_ref2:
+            case DW_FORM_data4:
+            case DW_FORM_ref4:
+            case DW_FORM_data8:
+            case DW_FORM_ref_sig8: // we won't even notice
+            case DW_FORM_ref8:
+            case DW_FORM_udata:
+            case DW_FORM_ref_udata:
+            case DW_FORM_sdata:
+            case DW_FORM_addr:
+            case DW_FORM_secoffset:
+                printf("%llx", *(uint64_t *) buf);
+                break;
+            case DW_FORM_block1:
+            case DW_FORM_block2:
+            case DW_FORM_block4:
+            case DW_FORM_block:
+            case DW_FORM_exprloc:
+                printf("some data");
+                break;
+            case DW_FORM_flag:
+            case DW_FORM_flag_present:
+                printf("%s", *(bool *) buf ? "true" : "false");
+                break;
+            default:
+                assert(0);
+            }
+            printf("\n");
+        }
+        if(ab->has_children)
+            depth++;
+    }
+}
+
 static void parse_debug_abbrev(struct reader r) {
     void *orig_ptr = r.ptr;
     while(r.ptr != r.end) {
@@ -591,7 +914,7 @@ static void parse_debug_abbrev(struct reader r) {
             if(!abbrev) {
                 break;
             }
-            uint64_t tag = read_uleb128(&r);
+            uint32_t tag = (uint32_t) read_uleb128(&r);
             uint8_t has_children = read_t(uint8_t, &r);
             kvec_t(struct dwarf_cached_attr) cas;
             kv_init(cas);
@@ -605,7 +928,6 @@ static void parse_debug_abbrev(struct reader r) {
                 if(attr_name == 0 && attr_form == 0) break;
                 struct dwarf_cached_attr ca;
                 ca.name = attr_name;
-                ca.form = attr_form;
 
                 // we'll need to be able to skip it in any case
                 switch(attr_form) {
@@ -616,6 +938,7 @@ static void parse_debug_abbrev(struct reader r) {
                 case DW_FORM_ref2:
                 case DW_FORM_ref4:
                 case DW_FORM_ref8:
+                case DW_FORM_ref_sig8:
                 case DW_FORM_ref_udata:
                 //case DW_FORM_ref_addr:
 
@@ -626,13 +949,16 @@ static void parse_debug_abbrev(struct reader r) {
                 case DW_FORM_udata:
                 case DW_FORM_sdata:
                 case DW_FORM_addr:
+                case DW_FORM_secoffset:
 
                 case DW_FORM_block1:
                 case DW_FORM_block2:
                 case DW_FORM_block4:
                 case DW_FORM_block:
+                case DW_FORM_exprloc:
 
                 case DW_FORM_flag:
+                case DW_FORM_flag_present:
                     break;
                 default:
                     panic("unknown form 0x%02llx for attr 0x%02llx\n", attr_form, attr_name);
@@ -668,6 +994,7 @@ static void parse_debug_abbrev(struct reader r) {
                     case DW_FORM_ref2:
                     case DW_FORM_ref4:
                     case DW_FORM_ref8:
+                    case DW_FORM_ref_sig8:
                     case DW_FORM_ref_udata:
                     //case DW_FORM_ref_addr:
                         break;
@@ -686,6 +1013,7 @@ static void parse_debug_abbrev(struct reader r) {
                     case DW_FORM_udata:
                     case DW_FORM_sdata:
                     case DW_FORM_addr:
+                    case DW_FORM_secoffset:
                         break;
                     default:
                         goto bad;
@@ -694,17 +1022,27 @@ static void parse_debug_abbrev(struct reader r) {
                 case DW_AT_data_member_location:
                     ca.node_offset = offsetof(struct dwarf_node, at_data_member_location);
                     ab.flag |= 1 << AFL_DATA_MEMBER_LOCATION;
-                    goto block;
+                    goto location;
                 case DW_AT_vtable_elem_location:
                     ca.node_offset = offsetof(struct dwarf_node, at_vtable_elem_location);
                     ab.flag |= 1 << AFL_VTABLE_ELEM_LOCATION;
-                    goto block;
-                block:
+                    goto location;
+                location:
                     switch(attr_form) {
                     case DW_FORM_block1:
                     case DW_FORM_block2:
                     case DW_FORM_block4:
                     case DW_FORM_block:
+                    case DW_FORM_exprloc:
+                        break;
+                    // apparently these are ok too
+                    case DW_FORM_data1:
+                    case DW_FORM_data2:
+                    case DW_FORM_data4:
+                    case DW_FORM_data8:
+                    case DW_FORM_udata:
+                    case DW_FORM_sdata:
+                        attr_form |= FORM_DATA_AS_LOCATION;
                         break;
                     default:
                         goto bad;
@@ -715,6 +1053,8 @@ static void parse_debug_abbrev(struct reader r) {
                     ca.node_offset = 0;
                     break;
                 }
+
+                ca.form = attr_form;
 
                 kv_push(struct dwarf_cached_attr, cas, ca);
                 continue;
@@ -823,6 +1163,18 @@ int main(int argc, char **argv) {
     assert(debug_abbrev.ptr);
     parse_debug_abbrev(debug_abbrev);
 
+    if(1) {
+        if(debug_info.ptr) {
+            printf(".debug_info:\n");
+            parse_all_cus(debug_info, debug_info_cu_dump, (void *) 0);
+        }
+        if(debug_types.ptr) {
+            printf(".debug_types:\n");
+            parse_all_cus(debug_types, debug_info_cu_dump, (void *) 1);
+        }
+        return 0;
+    }
+
     struct export_ctx ec;
     export_ctx_init(&ec);
     tjson_dict_start(&ec.tj);
@@ -831,7 +1183,7 @@ int main(int argc, char **argv) {
     } else {
         parse_all_cus(debug_info, debug_info_cu_to_json, &ec);
     }
-    if(1) { // xxx
+    if(1 && debug_pubnames.ptr) { // xxx
         tjson_dict_key(&ec.tj, ".globals");
         tjson_dict_start(&ec.tj);
         parse_all_cus(debug_pubnames, debug_pubnames_cu_to_json, &ec);

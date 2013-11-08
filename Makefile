@@ -1,5 +1,5 @@
 all: fastdwarf
-CFLAGS=-Wall -Wno-unused-function -Werror -Wno-error=unused-variable -O3 -ggdb -std=c11
+CFLAGS=-Wall -Wno-unused-function -Werror -Wno-error=unused-variable -O0 -ggdb -std=c11
 %.o: %.c *.h */*.h Makefile
 	cc $(CFLAGS) -c -o $@ $<
 fastdwarf: fastdwarf.o common.o
