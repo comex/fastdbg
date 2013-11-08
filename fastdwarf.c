@@ -61,6 +61,7 @@ struct cu_ctx {
     struct reader full_r; // the entire CU
     struct reader r; // where we're reading now
     bool is64;
+    int addr_bytes;
     // debug_info
     struct dwarf_abbr_cu *acu;
 
@@ -90,8 +91,13 @@ static struct reader read_cstr(struct reader *r) {
     return (struct reader) {ptr, ptr + len};
 }
 
-static uint64_t read_addr(struct cu_ctx *cu) {
+// 64 bits in the "64-bit DWARF format", etc.
+static uint64_t read_fmtbits(struct cu_ctx *cu) {
     return cu->is64 ? read_t(uint64_t, &cu->r) : read_t(uint32_t, &cu->r);
+}
+
+static uint64_t read_addr(struct cu_ctx *cu) {
+    return cu->addr_bytes == 8 ? read_t(uint64_t, &cu->r) : read_t(uint32_t, &cu->r);
 }
 
 // return whether there was a node (as opposed to a child end marker)
@@ -125,7 +131,7 @@ static bool parse_die(struct cu_ctx *cu, struct dwarf_node *node) {
         case DW_FORM_strp:
         {
             //printf("node_offset=%x\n", ca->node_offset);
-            uint64_t debug_str_offset = read_addr(cu);
+            uint64_t debug_str_offset = read_fmtbits(cu);
             assert(debug_str_offset < debug_str.end - debug_str.ptr);
             *(const char **) p = debug_str.ptr + debug_str_offset;
             break;
@@ -190,19 +196,19 @@ static bool parse_die(struct cu_ctx *cu, struct dwarf_node *node) {
 }
 
 static void parse_debug_info_header(struct cu_ctx *cu) {
-    uint64_t abbrev_offset = read_addr(cu);
+    uint64_t abbrev_offset = read_fmtbits(cu);
     khiter_t k = kh_get(abbr_cu, &dwarf_abbr_cus, abbrev_offset);
     assert(k != kh_end(&dwarf_abbr_cus));
     cu->acu = &kh_value(&dwarf_abbr_cus, k);
-    UNUSED uint8_t addr_bytes = read_t(uint8_t, &cu->r);
+    cu->addr_bytes = read_t(uint8_t, &cu->r);
 }
 
 static void parse_cu_header(struct cu_ctx *cu, struct reader *r) {
-    cu->is64 = false;
     uint64_t length = read_t(uint32_t, r);
+    cu->is64 = false;
     if(length == 0xffffffff) {
-        length = read_t(uint64_t, r);
         cu->is64 = true;
+        length = read_t(uint64_t, r);
     }
     void *ptr = r->ptr;
     cu->full_r = (struct reader) {ptr - 4, ptr + length};
@@ -466,8 +472,8 @@ static void var_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwa
 
 static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool is_types) {
     struct cu_ctx debug_info_cu;
-    uint64_t debug_info_offset = read_addr(cu);
-    uint64_t debug_info_size = read_addr(cu);
+    uint64_t debug_info_offset = read_fmtbits(cu);
+    uint64_t debug_info_size = read_fmtbits(cu);
     struct reader debug_info_r = reader_slice(debug_info, debug_info_offset, debug_info_size);
     parse_cu_header(&debug_info_cu, &debug_info_r);
     parse_debug_info_header(&debug_info_cu);
@@ -476,7 +482,7 @@ static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool
     if(is_types) {
         // get the qualified names
         while(1) {
-            uint64_t die_offset = read_addr(cu);
+            uint64_t die_offset = read_fmtbits(cu);
             if(!die_offset) break;
             struct reader myname = read_cstr(&cu->r);
             int _;
@@ -487,7 +493,7 @@ static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool
     }
 
     while(1) {
-        uint64_t die_offset = read_addr(cu);
+        uint64_t die_offset = read_fmtbits(cu);
         if(!die_offset) break;
         struct reader myname = read_cstr(&cu->r);
         debug_info_cu.r = reader_slice_to_end(debug_info_cu.full_r, die_offset);
