@@ -574,8 +574,10 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
             kv_push(char, suffix, '[');
             kv_push(char, suffix, ']');
             break;
+        case DW_TAG_ptr_to_member_type:
+            base = "XXX ptm";
+            goto b;
         case DW_TAG_subroutine_type: {
-            kv_push(char, prefix, '*');
             kv_push(char, prefix, '(');
             kv_push(char, suffix, ')');
             kv_push(char, suffix, '(');
@@ -602,6 +604,7 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
             panic("unknown tag 0x%02x in type\n", node.tag);
         }
     }
+    b:
     if(kv_size(prefix) == 0 && kv_size(suffix) == 0) {
         *must_free_p = free_base;
         res = base;
@@ -614,6 +617,8 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
         kv_push(char, result, kv_A(prefix, i - 1));
     kv_insert_a(char, result, kv_size(result), suffix.a, kv_size(suffix));
     kv_push(char, result, '\0');
+    kv_destroy(prefix);
+    kv_destroy(suffix);
     *must_free_p = true;
     if(free_base) free(base);
     res = result.a;
@@ -634,7 +639,7 @@ static uint64_t loc_to_offset(struct dwarf_location loc) {
     }
 }
 
-static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, const char *myname) {
+static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, const struct dwarf_node *node, const char *myname) {
     struct tjson *tj = &ec->tj;
     if(!(node->tag == DW_TAG_class_type || node->tag == DW_TAG_structure_type))
         return false;
@@ -823,6 +828,8 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
             switch(node.tag) {
             case DW_TAG_class_type:
             case DW_TAG_structure_type:
+            case DW_TAG_union_type:
+            case DW_TAG_enumeration_type:
             case DW_TAG_typedef:
             case DW_TAG_base_type: {
                 char *name;
@@ -831,13 +838,15 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
                     int _;
                     kh_value(ec->name_map, kh_put(ccp, ec->name_map, offset, &_)) = name;
                 } else {
+                    struct reader oldr = cu->r;
                     if(!struct_die_to_json(ec, cu, &node, name))
                         free(name);
+                    cu->r = oldr;
                 }
-                break;
+                // fall through
             }
-            case DW_TAG_namespace: {
-                if(pass == 0 && node.has_children) {
+            case DW_TAG_namespace:
+                if(node.has_children) {
                     // parse children
                     const char *nsname = (node.flag & (1 << AFL_NAME)) ? node.at_name : "<anon>";
                     kv_push(size_t, namespace_lens, kv_size(namespace));
@@ -847,7 +856,6 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
                     continue;
                 }
                 break;
-            }
             }
 
             // skip children
