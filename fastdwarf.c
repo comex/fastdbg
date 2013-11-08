@@ -329,6 +329,31 @@ static uint64_t read_addr(struct cu_ctx *cu) {
     return cu->addr_bytes == 8 ? read_t(uint64_t, &cu->r) : read_t(uint32_t, &cu->r);
 }
 
+static void export_ctx_init(struct export_ctx *ec, size_t debug_info_size) {
+    ec->tj = (struct tjson) {stdout};
+    ec->seen = kh_init(strset);
+    // a rough estimate to avoid rehashing
+    kh_resize(strset, ec->seen, debug_info_size / 1500);
+}
+
+static void export_ctx_destroy(struct export_ctx *ec) {
+    kh_destroy(strset, ec->seen);
+}
+
+static void export_ctx_init_cu(struct export_ctx *ec) {
+    ec->name_map = kh_init(ccp);
+    ec->name_map_needs_mass_free = false;
+}
+
+static void export_ctx_destroy_cu(struct export_ctx *ec) {
+    if(ec->name_map_needs_mass_free) {
+        // my hash table does this macro better.
+        const char *name;
+        kh_foreach_value(ec->name_map, name, free((char *) name));
+    }
+    kh_destroy(ccp, ec->name_map);
+}
+
 static void parse_attr(struct cu_ctx *cu, uint64_t form, void *p) {
     struct reader *r = &cu->r;
     uint64_t blocklen;
@@ -609,20 +634,20 @@ static uint64_t loc_to_offset(struct dwarf_location loc) {
     }
 }
 
-static void struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, const char *myname) {
+static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, const char *myname) {
     struct tjson *tj = &ec->tj;
     if(!(node->tag == DW_TAG_class_type || node->tag == DW_TAG_structure_type))
-        return;
+        return false;
     if(!(node->flag & (1 << AFL_BYTE_SIZE))) {
         // partial
-        return;
+        return false;
     }
 
     int putret;
     kh_put(strset, ec->seen, myname, &putret);
     if(putret <= 0) {
         // already seen
-        return;
+        return false;
     }
 
     tjson_dict_key(tj, myname);
@@ -708,6 +733,7 @@ static void struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct 
             kv_destroy(vtable_elems);
         }
     tjson_dict_end(tj);
+    return true;
 }
 
 static void var_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, const char *myname) {
@@ -727,6 +753,7 @@ static void var_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwa
 }
 
 static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool is_types) {
+    export_ctx_init_cu(ec);
     struct cu_ctx debug_info_cu;
     uint64_t debug_info_offset = read_fmtbits(cu);
     uint64_t debug_info_size = read_fmtbits(cu);
@@ -760,6 +787,7 @@ static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool
         else
             var_die_to_json(ec, &debug_info_cu, &node, myname.ptr);
     }
+    export_ctx_destroy_cu(ec);
 }
 
 static void debug_pubnames_cu_to_json(struct cu_ctx *cu, void *_ec) {
@@ -774,6 +802,7 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     // basically, brute force
     parse_debug_info_header(cu);
     struct export_ctx *ec = _ec;
+    export_ctx_init_cu(ec);
     struct reader oldr = cu->r;
     kvec_t(char) namespace = {0};
     kvec_t(size_t) namespace_lens = {0};
@@ -795,18 +824,20 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
             case DW_TAG_class_type:
             case DW_TAG_structure_type:
             case DW_TAG_typedef:
-            case DW_TAG_base_type:
+            case DW_TAG_base_type: {
+                char *name;
+                asprintf(&name, "%.*s%s", (int) namespace.n, namespace.a, node.at_name);
                 if(pass == 0) {
                     int _;
-                    char *name;
-                    asprintf(&name, "%.*s%s", (int) namespace.n, namespace.a, node.at_name);
                     kh_value(ec->name_map, kh_put(ccp, ec->name_map, offset, &_)) = name;
                 } else {
-                    struct_die_to_json(ec, cu, &node, node.at_name);
+                    if(!struct_die_to_json(ec, cu, &node, name))
+                        free(name);
                 }
                 break;
+            }
             case DW_TAG_namespace: {
-                if(pass == 0) {
+                if(pass == 0 && node.has_children) {
                     // parse children
                     const char *nsname = (node.flag & (1 << AFL_NAME)) ? node.at_name : "<anon>";
                     kv_push(size_t, namespace_lens, kv_size(namespace));
@@ -831,6 +862,9 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     }
 
     ec->name_map_needs_mass_free = true;
+    kv_destroy(namespace);
+    kv_destroy(namespace_lens);
+    export_ctx_destroy_cu(ec);
 }
 
 static void debug_info_cu_dump(struct cu_ctx *restrict cu, void *is_types) {
@@ -1070,23 +1104,6 @@ static void parse_debug_abbrev(struct reader r) {
     }
 }
 
-static void export_ctx_init(struct export_ctx *ec) {
-    ec->tj = (struct tjson) {stdout};
-    ec->seen = kh_init(strset);
-    ec->name_map = kh_init(ccp);
-    ec->name_map_needs_mass_free = false;
-}
-
-static void export_ctx_destroy(struct export_ctx *ec) {
-    if(ec->name_map_needs_mass_free) {
-        // my hash table does this macro better.
-        const char *name;
-        kh_foreach_value(ec->name_map, name, free((char *) name));
-    }
-    kh_destroy(ccp, ec->name_map);
-    kh_destroy(strset, ec->seen);
-}
-
 int main(int argc, char **argv) {
     set_block_buffered(stdout);
 
@@ -1163,7 +1180,7 @@ int main(int argc, char **argv) {
     assert(debug_abbrev.ptr);
     parse_debug_abbrev(debug_abbrev);
 
-    if(1) {
+    if(0) {
         if(debug_info.ptr) {
             printf(".debug_info:\n");
             parse_all_cus(debug_info, debug_info_cu_dump, (void *) 0);
@@ -1176,9 +1193,9 @@ int main(int argc, char **argv) {
     }
 
     struct export_ctx ec;
-    export_ctx_init(&ec);
+    export_ctx_init(&ec, debug_info.end - debug_info.ptr);
     tjson_dict_start(&ec.tj);
-    if(debug_pubtypes.ptr) {
+    if(debug_pubtypes.ptr && 0) {
         parse_all_cus(debug_pubtypes, debug_pubtypes_cu_to_json, &ec);
     } else {
         parse_all_cus(debug_info, debug_info_cu_to_json, &ec);
