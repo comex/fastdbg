@@ -20,6 +20,7 @@ uint64_t read_leb128_rest(struct reader *r, bool is_signed) {
 }
 
 void tjson_newline(struct tjson *tj) {
+    assert(tj->indent < 1000000);
     _putc('\n', tj->fp);
     size_t nspaces = tj->indent * 2;
     for (size_t i = 0; i < nspaces; i++)

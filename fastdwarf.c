@@ -67,14 +67,16 @@ struct cu_ctx {
 };
 
 KHASH_SET_INIT_STR(strset)
+KHASH_MAP_INIT_INT64(ccp, const char *)
+KHASH_MAP_INIT_INT64(abbr_cu, struct dwarf_abbr_cu)
 
 struct export_ctx {
     struct tjson tj;
     khash_t(strset) *seen;
+    khash_t(ccp) *name_map;
+    bool name_map_needs_mass_free;
 };
 
-KHASH_MAP_INIT_INT64(abbr_cu, struct dwarf_abbr_cu)
-KHASH_MAP_INIT_INT64(ccp, const char *)
 static khash_t(abbr_cu) dwarf_abbr_cus;
 static struct reader debug_str, debug_info;
 static void *entire_file_start;
@@ -233,8 +235,10 @@ static void parse_all_cus(struct reader r, void (*action)(struct cu_ctx *cu, voi
 // also gets the size
 static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint64_t offset, bool *must_free_p, size_t *sizep) {
     // i should probably have a string library.
+    struct reader oldr = cu->r;
     kvec_t(char) prefix = {0}, suffix = {0};
     char *base = NULL;
+    char *res;
     bool free_base = false;
     bool first = true;
     while(1) {
@@ -303,10 +307,8 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
                 }
                 firstarg = false;
                 bool must_free;
-                struct reader old = cu->r;
                 size_t ignsize;
                 char *argtype = get_full_type_name(cu, name_map, subnode.at_type, &must_free, &ignsize);
-                cu->r = old;
                 kv_insert_a(char, suffix, kv_size(suffix), argtype, strlen(argtype));
                 if(must_free) free(argtype);
             }
@@ -319,7 +321,8 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
     }
     if(kv_size(prefix) == 0 && kv_size(suffix) == 0) {
         *must_free_p = free_base;
-        return base;
+        res = base;
+        goto end;
     }
     kvec_t(char) result = {0};
     kv_insert_a(char, result, kv_size(result), base, strlen(base));
@@ -330,7 +333,10 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
     kv_push(char, result, '\0');
     *must_free_p = true;
     if(free_base) free(base);
-    return result.a;
+    res = result.a;
+end:
+    cu->r = oldr;
+    return res;
 }
 
 static uint64_t loc_to_offset(struct reader loc) {
@@ -341,7 +347,7 @@ static uint64_t loc_to_offset(struct reader loc) {
         return -1;
 }
 
-static void die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, khash_t(ccp) *name_map, const char *myname) {
+static void struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, const char *myname) {
     struct tjson *tj = &ec->tj;
     if(!(node->tag == DW_TAG_class_type || node->tag == DW_TAG_structure_type))
         return;
@@ -390,7 +396,7 @@ static void die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_n
                 }
                 bool free_typename;
                 size_t size;
-                char *typename = get_full_type_name(cu, name_map, subnode.at_type, &free_typename, &size);
+                char *typename = get_full_type_name(cu, ec->name_map, subnode.at_type, &free_typename, &size);
 
                 tjson_dict_start(tj);
                     tjson_dict_key(tj, "name");
@@ -442,8 +448,23 @@ static void die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_n
     tjson_dict_end(tj);
 }
 
-static void debug_pubtypes_cu_to_json(struct cu_ctx *cu, void *_ec) {
-    struct export_ctx *ec = _ec;
+static void var_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwarf_node *node, const char *myname) {
+    if(node->tag != DW_TAG_variable)
+        return;
+    if(!(node->flag & (1 << AFL_TYPE)))
+        return;
+    int putret;
+    kh_put(strset, ec->seen, myname, &putret);
+    if(putret <= 0)
+        return;
+    tjson_dict_key(&ec->tj, myname);
+    size_t ignsize;
+    bool must_free;
+    char *type = get_full_type_name(cu, ec->name_map, node->at_type, &must_free, &ignsize);
+    tjson_str(&ec->tj, type);
+}
+
+static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool is_types) {
     struct cu_ctx debug_info_cu;
     uint64_t debug_info_offset = read_addr(cu);
     uint64_t debug_info_size = read_addr(cu);
@@ -451,18 +472,20 @@ static void debug_pubtypes_cu_to_json(struct cu_ctx *cu, void *_ec) {
     parse_cu_header(&debug_info_cu, &debug_info_r);
     parse_debug_info_header(&debug_info_cu);
     struct reader oldr = cu->r;
-    khash_t(ccp) *name_map = kh_init(ccp);
 
-    // get the qualified names
-    while(1) {
-        uint64_t die_offset = read_addr(cu);
-        if(!die_offset) break;
-        struct reader myname = read_cstr(&cu->r);
-        int _;
-        kh_value(name_map, kh_put(ccp, name_map, die_offset, &_)) = myname.ptr;
+    if(is_types) {
+        // get the qualified names
+        while(1) {
+            uint64_t die_offset = read_addr(cu);
+            if(!die_offset) break;
+            struct reader myname = read_cstr(&cu->r);
+            int _;
+            kh_value(ec->name_map, kh_put(ccp, ec->name_map, die_offset, &_)) = myname.ptr;
+        }
+
+        cu->r = oldr;
     }
 
-    cu->r = oldr;
     while(1) {
         uint64_t die_offset = read_addr(cu);
         if(!die_offset) break;
@@ -470,10 +493,19 @@ static void debug_pubtypes_cu_to_json(struct cu_ctx *cu, void *_ec) {
         debug_info_cu.r = reader_slice_to_end(debug_info_cu.full_r, die_offset);
         struct dwarf_node node;
         assert(parse_die(&debug_info_cu, &node));
-        die_to_json(ec, &debug_info_cu, &node, name_map, myname.ptr);
+        if(is_types)
+            struct_die_to_json(ec, &debug_info_cu, &node, myname.ptr);
+        else
+            var_die_to_json(ec, &debug_info_cu, &node, myname.ptr);
     }
+}
 
-    kh_destroy(ccp, name_map);
+static void debug_pubnames_cu_to_json(struct cu_ctx *cu, void *_ec) {
+    debug_pubx_cu_to_json(cu, _ec, false);
+}
+
+static void debug_pubtypes_cu_to_json(struct cu_ctx *cu, void *_ec) {
+    debug_pubx_cu_to_json(cu, _ec, true);
 }
 
 static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
@@ -481,7 +513,6 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     parse_debug_info_header(cu);
     struct export_ctx *ec = _ec;
     struct reader oldr = cu->r;
-    khash_t(ccp) *name_map = kh_init(ccp);
     kvec_t(char) namespace = {0};
     kvec_t(size_t) namespace_lens = {0};
 
@@ -507,9 +538,9 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
                     int _;
                     char *name;
                     asprintf(&name, "%.*s%s", (int) namespace.n, namespace.a, node.at_name);
-                    kh_value(name_map, kh_put(ccp, name_map, offset, &_)) = name;
+                    kh_value(ec->name_map, kh_put(ccp, ec->name_map, offset, &_)) = name;
                 } else {
-                    die_to_json(ec, cu, &node, name_map, node.at_name);
+                    struct_die_to_json(ec, cu, &node, node.at_name);
                 }
                 break;
             case DW_TAG_namespace: {
@@ -537,10 +568,7 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
         cu->r = oldr;
     }
 
-    // my hash table does this better.
-    const char *name;
-    kh_foreach_value(name_map, name, free((char *) name));
-    kh_destroy(ccp, name_map);
+    ec->name_map_needs_mass_free = true;
 }
 
 static void parse_debug_abbrev(struct reader r) {
@@ -696,6 +724,23 @@ static void parse_debug_abbrev(struct reader r) {
     }
 }
 
+static void export_ctx_init(struct export_ctx *ec) {
+    ec->tj = (struct tjson) {stdout};
+    ec->seen = kh_init(strset);
+    ec->name_map = kh_init(ccp);
+    ec->name_map_needs_mass_free = false;
+}
+
+static void export_ctx_destroy(struct export_ctx *ec) {
+    if(ec->name_map_needs_mass_free) {
+        // my hash table does this macro better.
+        const char *name;
+        kh_foreach_value(ec->name_map, name, free((char *) name));
+    }
+    kh_destroy(ccp, ec->name_map);
+    kh_destroy(strset, ec->seen);
+}
+
 int main(int argc, char **argv) {
     set_block_buffered(stdout);
 
@@ -713,7 +758,7 @@ int main(int argc, char **argv) {
     const char *testhdr = file_map;
     assert(!memcmp(testhdr, ELFMAG, 4));
 
-    struct reader debug_types = {0}, debug_abbrev = {0}, debug_pubtypes = {0};
+    struct reader debug_types = {0}, debug_abbrev = {0}, debug_pubtypes = {0}, debug_pubnames = {0};
 
     switch(testhdr[EI_CLASS]) {
 #define CASES(text...) \
@@ -752,6 +797,8 @@ int main(int argc, char **argv) {
                 reader = &debug_types;
             } else if(!strncmp(name, ".debug_pubtypes", name_size)) {
                 reader = &debug_pubtypes;
+            } else if(!strncmp(name, ".debug_pubnames", name_size)) {
+                reader = &debug_pubnames;
             } else if(!strncmp(name, ".debug_str", name_size)) {
                 reader = &debug_str;
             } else {
@@ -770,13 +817,21 @@ int main(int argc, char **argv) {
     assert(debug_abbrev.ptr);
     parse_debug_abbrev(debug_abbrev);
 
-    struct export_ctx ec = {{stdout}, kh_init(strset)};
+    struct export_ctx ec;
+    export_ctx_init(&ec);
     tjson_dict_start(&ec.tj);
     if(debug_pubtypes.ptr) {
         parse_all_cus(debug_pubtypes, debug_pubtypes_cu_to_json, &ec);
     } else {
         parse_all_cus(debug_info, debug_info_cu_to_json, &ec);
     }
+    if(1) { // xxx
+        tjson_dict_key(&ec.tj, ".globals");
+        tjson_dict_start(&ec.tj);
+        parse_all_cus(debug_pubnames, debug_pubnames_cu_to_json, &ec);
+        tjson_dict_end(&ec.tj);
+    }
     tjson_dict_end(&ec.tj);
     putchar('\n');
+    export_ctx_destroy(&ec);
 }
