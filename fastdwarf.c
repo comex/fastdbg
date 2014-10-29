@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include "safe-math.h"
 #include "elf.h"
+#include "mach-o/loader.h"
 #include "common.h"
 #include "klib/kvec.h"
 #include "klib/khash.h"
@@ -309,7 +310,9 @@ struct export_ctx {
 
 static khash_t(abbr_cu) dwarf_abbr_cus;
 static struct reader debug_str, debug_info;
-static void *entire_file_start;
+static struct reader debug_types, debug_abbrev, debug_pubtypes, debug_pubnames;
+static void *file_map;
+static size_t file_size;
 
 static struct reader read_cstr(struct reader *r) {
     size_t len = strnlen(r->ptr, r->end - r->ptr);
@@ -447,7 +450,7 @@ static bool parse_die(struct cu_ctx *cu, struct dwarf_node *node) {
     if(abbrev >= kv_size(cu->acu->abbrs) ||
        (ab = &kv_A(cu->acu->abbrs, abbrev), !ab->tag))
         panic("bad abbrev 0x%02llx (we probably got misaligned)\n", abbrev);
-    node->uid = r->ptr - entire_file_start;
+    node->uid = r->ptr - file_map;
     node->tag = ab->tag;
     node->has_children = ab->has_children;
     node->flag = ab->flag;
@@ -774,7 +777,8 @@ static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool
             if(!die_offset) break;
             struct reader myname = read_cstr(&cu->r);
             int _;
-            kh_value(ec->name_map, kh_put(ccp, ec->name_map, die_offset, &_)) = myname.ptr;
+            khiter_t k = kh_put(ccp, ec->name_map, die_offset, &_);
+            kh_value(ec->name_map, k) = myname.ptr;
         }
 
         cu->r = oldr;
@@ -836,7 +840,8 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
                 asprintf(&name, "%.*s%s", (int) namespace.n, namespace.a, node.at_name);
                 if(pass == 0) {
                     int _;
-                    kh_value(ec->name_map, kh_put(ccp, ec->name_map, offset, &_)) = name;
+                    khiter_t k = kh_put(ccp, ec->name_map, offset, &_);
+                    kh_value(ec->name_map, k) = name;
                 } else {
                     struct reader oldr = cu->r;
                     if(!struct_die_to_json(ec, cu, &node, name))
@@ -1112,25 +1117,25 @@ static void parse_debug_abbrev(struct reader r) {
     }
 }
 
-int main(int argc, char **argv) {
-    set_block_buffered(stdout);
 
-    int fd = open(argv[1], O_RDONLY);
-    assert(fd != -1);
-    off_t off = lseek(fd, 0, SEEK_END);
-    size_t size = off;
-    assert(off == size);
-    void *file_map = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
-    assert(file_map != MAP_FAILED);
+static struct reader *get_reader_for_sectname(const char *name, size_t name_size) {
+    if(!strncmp(name, "debug_abbrev", name_size))
+        return &debug_abbrev;
+    else if(!strncmp(name, "debug_info", name_size))
+        return &debug_info;
+    else if(!strncmp(name, "debug_types", name_size))
+        return &debug_types;
+    else if(!strncmp(name, "debug_pubtypes", name_size))
+        return &debug_pubtypes;
+    else if(!strncmp(name, "debug_pubnames", name_size))
+        return &debug_pubnames;
+    else if(!strncmp(name, "debug_str", name_size))
+        return &debug_str;
+    else
+        return NULL;
+}
 
-    entire_file_start = file_map;
-
-    assert(size >= 5);
-    const char *testhdr = file_map;
-    assert(!memcmp(testhdr, ELFMAG, 4));
-
-    struct reader debug_types = {0}, debug_abbrev = {0}, debug_pubtypes = {0}, debug_pubnames = {0};
-
+static void parse_elf(const char *testhdr) {
     switch(testhdr[EI_CLASS]) {
 #define CASES(text...) \
     case ELFCLASS32: { \
@@ -1146,9 +1151,9 @@ int main(int argc, char **argv) {
         break; \
     }
     CASES(
-        assert(sizeof(ehdr) <= size);
+        assert(sizeof(ehdr) <= file_size);
         ehdr *eh = file_map;
-        assert(sadd64(eh->e_shoff, smul64(eh->e_shnum, eh->e_shentsize)) <= size);
+        assert(sadd64(eh->e_shoff, smul64(eh->e_shnum, eh->e_shentsize)) <= file_size);
         assert(eh->e_shstrndx <= eh->e_shnum);
         shdr *strsh = (void *) ((char *) file_map + eh->e_shoff + eh->e_shstrndx * eh->e_shentsize);
 
@@ -1156,33 +1161,94 @@ int main(int argc, char **argv) {
             shdr *sh = (void *) ((char *) file_map + eh->e_shoff + i * eh->e_shentsize);
             assert(sh->sh_name < strsh->sh_size);
             uint64_t name_off = sadd64(sh->sh_name, strsh->sh_offset);
-            assert(name_off < size);
+            assert(name_off < file_size);
             const char *name = (char *) file_map + name_off;
-            size_t name_size = size - name_off;
-            struct reader *reader;
-            if(!strncmp(name, ".debug_abbrev", name_size)) {
-                reader = &debug_abbrev;
-            } else if(!strncmp(name, ".debug_info", name_size)) {
-                reader = &debug_info;
-            } else if(!strncmp(name, ".debug_types", name_size)) {
-                reader = &debug_types;
-            } else if(!strncmp(name, ".debug_pubtypes", name_size)) {
-                reader = &debug_pubtypes;
-            } else if(!strncmp(name, ".debug_pubnames", name_size)) {
-                reader = &debug_pubnames;
-            } else if(!strncmp(name, ".debug_str", name_size)) {
-                reader = &debug_str;
-            } else {
-                continue;
+            size_t name_size = file_size - name_off;
+            struct reader *reader = get_reader_for_sectname(name + 1, name_size ? (name_size - 1) : 0);
+            if(reader) {
+                assert(sadd64(sh->sh_offset, sh->sh_size) <= file_size);
+                reader->ptr = (char *) file_map + sh->sh_offset;
+                reader->end = reader->ptr + sh->sh_size;
             }
-            assert(sadd64(sh->sh_offset, sh->sh_size) <= size);
-            reader->ptr = (char *) file_map + sh->sh_offset;
-            reader->end = reader->ptr + sh->sh_size;
         }
     )
+#undef CASES
 
     default:
         assert(false);
+    }
+}
+
+static void parse_macho() {
+    struct mach_header *mh = file_map;
+    struct mach_header_64 *mh64 = file_map;
+    struct load_command *load_commands;
+    if(mh->magic == MH_MAGIC_64)
+        load_commands = (void *) (mh64 + 1);
+    else
+        load_commands = (void *) (mh + 1);
+    struct load_command *lc = load_commands;
+    for(uint32_t i = 0; i < mh->ncmds; i++) {
+        assert(sadd64((void *) lc - file_map, sizeof(*lc)) <= file_size);
+        assert(sadd64((void *) lc - file_map, lc->cmdsize) <= file_size);
+        switch(lc->cmd) {
+#define CASES(text...) \
+    case LC_SEGMENT: { \
+        typedef struct segment_command segcmd; \
+        typedef struct section sectcmd; \
+        text \
+        break; \
+    } \
+    case LC_SEGMENT_64: { \
+        typedef struct segment_command_64 segcmd; \
+        typedef struct section_64 sectcmd; \
+        text \
+        break; \
+    }
+        CASES(
+            segcmd *seg = (void *) lc;
+            assert(lc->cmdsize >= sizeof(*seg));
+            sectcmd *sect = (void *) (seg + 1);
+            assert(sadd64(sizeof(*seg), smul64(seg->nsects, sizeof(*sect))) <= lc->cmdsize);
+            for(uint32_t i = 0; i < seg->nsects; i++, sect++) {
+                const char *name = sect->sectname;
+                if(!(name[0] == '_' && name[1] == '_'))
+                    continue;
+                struct reader *reader = get_reader_for_sectname(name + 2, 14);
+                if(reader) {
+                    assert(sadd64(sect->offset, sect->size) <= file_size);
+                    reader->ptr = file_map + sect->offset;
+                    reader->end = reader->ptr + sect->size;
+                }
+            }
+        )
+        default:
+            break;
+        }
+
+        lc = (void *) lc + lc->cmdsize;
+    }
+}
+
+int main(int argc, char **argv) {
+    set_block_buffered(stdout);
+
+    int fd = open(argv[1], O_RDONLY);
+    assert(fd != -1);
+    off_t off = lseek(fd, 0, SEEK_END);
+    file_size = off;
+    assert(off == file_size);
+    file_map = mmap(NULL, file_size, PROT_READ, MAP_SHARED, fd, 0);
+    assert(file_map != MAP_FAILED);
+
+    assert(file_size >= 5);
+    const char *testhdr = file_map;
+    if(!memcmp(testhdr, ELFMAG, 4)) {
+        parse_elf(testhdr);
+    } else if(*(uint32_t *) testhdr == MH_MAGIC || *(uint32_t *) testhdr == MH_MAGIC_64) { // not bothering with swapping for now
+        parse_macho();
+    } else {
+        assert(!"Unknown file type");
     }
 
     assert(debug_abbrev.ptr);

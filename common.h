@@ -10,6 +10,7 @@
 }...}
 */
 
+#define _BSD_SOURCE
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
