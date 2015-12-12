@@ -253,15 +253,20 @@ struct dwarf_location {
     bool is_constant;
 };
 
+struct dwarf_ref {
+    bool is_ref_addr;
+    uint64_t offset;
+};
+
 struct dwarf_node {
     uint32_t tag;
     bool has_children;
     uint32_t flag;
     uint64_t uid;
     const char *at_name;
-    uint64_t at_type;
-    uint64_t at_specification;
-    uint64_t at_sibling;
+    struct dwarf_ref at_type;
+    struct dwarf_ref at_specification;
+    struct dwarf_ref at_sibling;
     uint64_t at_byte_size;
     struct dwarf_location at_data_member_location;
     struct dwarf_location at_vtable_elem_location;
@@ -284,16 +289,19 @@ struct dwarf_abbr_cu {
     kvec_t(struct dwarf_abbr) abbrs;
 };
 
+typedef kvec_t(struct reader) cu_reader_vec;
 struct cu_ctx {
     struct reader full_r; // the entire CU
     struct reader r; // where we're reading now
     bool is64;
+    uint16_t version;
     int addr_bytes;
     // debug_info
     struct dwarf_abbr_cu *acu;
     // debug_types
     uint64_t type_signature;
     uint64_t type_offset;
+    cu_reader_vec *sibling_vec;
 
 };
 
@@ -332,6 +340,34 @@ static uint64_t read_addr(struct cu_ctx *cu) {
     return cu->addr_bytes == 8 ? read_t(uint64_t, &cu->r) : read_t(uint32_t, &cu->r);
 }
 
+static void switch_to_dwarf_ref(struct cu_ctx *cu, struct dwarf_ref ref) {
+    if (!ref.is_ref_addr) {
+        cu->r = reader_slice_to_end(cu->full_r, ref.offset);
+    } else {
+        cu->r = reader_slice_to_end(debug_info, ref.offset);
+        void *ptr = cu->r.ptr;
+        cu_reader_vec *v = cu->sibling_vec;
+        size_t lo = 0, hi = v->n - 1;
+        while(lo < hi) {
+            size_t mid = (lo + hi) / 2;
+            struct reader r = v->a[mid];
+            if(ptr >= r.ptr && ptr < r.end) {
+                cu->full_r = 
+                return;
+            }
+
+        }
+        assert(v);
+        assert(cu-
+            
+
+    }
+switch_to_dwarf_ref
+inline struct reader slice_ref_to_end(const struct cu_ctx *cu, struct dwarf_ref offset) {
+    struct reader base = offset.is_ref_addr ? debug_info : cu->full_r;
+    return reader_slice_to_end(base, offset.offset);
+}
+
 static void export_ctx_init(struct export_ctx *ec, size_t debug_info_size) {
     ec->tj = (struct tjson) {stdout};
     ec->seen = kh_init(strset);
@@ -360,11 +396,14 @@ static void export_ctx_destroy_cu(struct export_ctx *ec) {
 static void parse_attr(struct cu_ctx *cu, uint64_t form, void *p) {
     struct reader *r = &cu->r;
     uint64_t blocklen;
+    struct dwarf_ref *pref = p;
+    //printf("form=%s rp=%p\n", dwarf_form_name(form & ~FORM_DATA_AS_LOCATION), r->ptr);
     switch(form & ~FORM_DATA_AS_LOCATION) {
     case DW_FORM_strp:
     {
         //printf("node_offset=%x\n", ca->node_offset);
         uint64_t debug_str_offset = read_fmtbits(cu);
+        //printf("%llx %llx\n", debug_str_offset, debug_str.end - debug_str.ptr);
         assert(debug_str_offset < debug_str.end - debug_str.ptr);
         *(const char **) p = debug_str.ptr + debug_str_offset;
         break;
@@ -374,24 +413,18 @@ static void parse_attr(struct cu_ctx *cu, uint64_t form, void *p) {
         break;
 
     case DW_FORM_data1:
-    case DW_FORM_ref1:
         *(uint64_t *) p = read_t(uint8_t, r);
         break;
     case DW_FORM_data2:
-    case DW_FORM_ref2:
         *(uint64_t *) p = read_t(uint16_t, r);
         break;
     case DW_FORM_data4:
-    case DW_FORM_ref4:
         *(uint64_t *) p = read_t(uint32_t, r);
         break;
     case DW_FORM_data8:
-    case DW_FORM_ref_sig8: // we won't even notice
-    case DW_FORM_ref8:
         *(uint64_t *) p = read_t(uint64_t, r);
         break;
     case DW_FORM_udata:
-    case DW_FORM_ref_udata:
         *(uint64_t *) p = read_uleb128(r);
         break;
     case DW_FORM_sdata:
@@ -423,6 +456,33 @@ static void parse_attr(struct cu_ctx *cu, uint64_t form, void *p) {
         loc->r.end = r->ptr;
         break;
     }
+
+    case DW_FORM_ref1:
+        pref->is_ref_addr = false;
+        pref->offset = read_t(uint8_t, r);
+        break;
+    case DW_FORM_ref2:
+        pref->is_ref_addr = false;
+        pref->offset = read_t(uint16_t, r);
+        break;
+    case DW_FORM_ref4:
+        pref->is_ref_addr = false;
+        pref->offset = read_t(uint32_t, r);
+        break;
+    case DW_FORM_ref_sig8: // we won't even notice
+    case DW_FORM_ref8:
+        pref->is_ref_addr = false;
+        pref->offset = read_t(uint64_t, r);
+        break;
+    case DW_FORM_ref_udata:
+        pref->is_ref_addr = false;
+        pref->offset = read_uleb128(r);
+        break;
+    case DW_FORM_ref_addr:
+        pref->is_ref_addr = true;
+        pref->offset = cu->version >= 3 ? read_fmtbits(cu) : read_addr(cu);
+        break;
+
     case DW_FORM_flag:
         *(bool *) p = read_t(uint8_t, r);
         break;
@@ -450,11 +510,12 @@ static bool parse_die(struct cu_ctx *cu, struct dwarf_node *node) {
     if(abbrev >= kv_size(cu->acu->abbrs) ||
        (ab = &kv_A(cu->acu->abbrs, abbrev), !ab->tag))
         panic("bad abbrev 0x%02llx (we probably got misaligned)\n", abbrev);
+    memset(node, 0xff, sizeof(*node));
     node->uid = r->ptr - file_map;
     node->tag = ab->tag;
     node->has_children = ab->has_children;
     node->flag = ab->flag;
-    //printf("abbrev=0x%llx tag=0x%02llx children=%d\n", abbrev, ab->tag, ab->has_children);
+    //printf("abbrev=0x%llx tag=0x%02x children=%d\n", abbrev, ab->tag, ab->has_children);
     for(struct dwarf_cached_attr *ca = ab->attrs; ca->form; ca++) {
         char crap[64];
         void *p;
@@ -492,51 +553,59 @@ static void parse_cu_header(struct cu_ctx *cu, struct reader *r) {
     }
     void *ptr = r->ptr;
     cu->full_r = (struct reader) {ptr - 4, ptr + length};
-    UNUSED uint16_t version = read_t(uint16_t, r);
+    uint16_t version = read_t(uint16_t, r);
     assert(version >= 2 && version <= 10);
+    cu->version = version;
     read_bytes(r, length - 2);
     cu->r = reader_slice_to_end(cu->full_r, 6);
+    cu->sibling_vec = NULL;
 }
 
 static void parse_all_cus(struct reader r, void (*action)(struct cu_ctx *cu, void *context), void *context) {
     struct reader oldr = r;
-    uint64_t count = 0;
+    cu_reader_vec sibling_vec = {0};
     while(r.ptr != r.end) {
         struct cu_ctx cu;
         parse_cu_header(&cu, &r);
-        count++;
+        kv_push(struct reader, sibling_vec, cu.full_r);
     }
     r = oldr;
     uint64_t i = 0;
     while(r.ptr != r.end) {
         if(i % 100 == 0)
-            fprintf(stderr, "[%llu/%llu]\n", i, count);
+            fprintf(stderr, "[%llu/%llu]\n", i, sibling_vec.n);
         i++;
         struct cu_ctx cu;
         parse_cu_header(&cu, &r);
+        cu.sibling_vec = &sibling_vec;
         action(&cu, context);
     }
 }
 
 // also gets the size
-static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint64_t offset, bool *must_free_p, size_t *sizep) {
+static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, struct dwarf_ref offset, bool *must_free_p, size_t *sizep) {
     // i should probably have a string library.
-    struct reader oldr = cu->r;
+    struct reader oldr = cu->r, oldbr = cu->base_r;
     kvec_t(char) prefix = {0}, suffix = {0};
     char *base = NULL;
     char *res;
     bool free_base = false;
     bool first = true;
     while(1) {
-        cu->r = reader_slice_to_end(cu->full_r, offset);
+        switch_to_dwarf_ref(cu, offset);
         struct dwarf_node node;
+        //printf("GFTY> %d\n", offset.is_ref_addr);
         assert(parse_die(cu, &node));
+        //printf("<GFTY\n");
         if(first) {
             *sizep = (node.flag & (1 << AFL_BYTE_SIZE)) ? node.at_byte_size : -1;
             first = false;
         }
         if(!(node.flag & (1 << AFL_TYPE))) {
-            khiter_t k = kh_get(ccp, name_map, offset);
+            int64_t nmkey = offset.offset;
+            if (offset.is_ref_addr)
+                nmkey = -nmkey;
+            khiter_t k = kh_get(ccp, name_map, nmkey);
             if(k != kh_end(name_map))
                 base = (char *) kh_value(name_map, k);
             if(node.flag & (1 << AFL_SPECIFICATION)) {
@@ -604,6 +673,7 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
             break;
         }
         default:
+            base = "?????"; goto b;
             panic("unknown tag 0x%02x in type\n", node.tag);
         }
     }
@@ -627,6 +697,8 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, uint6
     res = result.a;
 end:
     cu->r = oldr;
+    cu->base_r = oldbr;
+    //printf("res=%s\n", res);
     return res;
 }
 
@@ -672,7 +744,7 @@ static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, const s
         struct dwarf_node subnode;
         if(node->has_children)
         while(parse_die(cu, &subnode)) {
-            struct reader next = cu->r;
+            //struct reader next = cu->r;
 
             const char *name;
             if(subnode.tag == DW_TAG_inheritance)
@@ -723,8 +795,7 @@ static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, const s
             }
 
             if(subnode.flag & (1 << AFL_SIBLING))
-                next = reader_slice_to_end(cu->full_r, subnode.at_sibling);
-            cu->r = next;
+                switch_to_dwarf_ref(cu, subnode.at_sibling);
         }
         tjson_list_end(tj);
         if(kv_size(vtable_elems)) {
@@ -769,6 +840,8 @@ static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool
     parse_cu_header(&debug_info_cu, &debug_info_r);
     parse_debug_info_header(&debug_info_cu);
     struct reader oldr = cu->r;
+    struct cu_rstate old = cu_get_rstate(cu);
+
 
     if(is_types) {
         // get the qualified names
@@ -812,7 +885,7 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     parse_debug_info_header(cu);
     struct export_ctx *ec = _ec;
     export_ctx_init_cu(ec);
-    struct reader oldr = cu->r;
+    struct reader oldr = cu->r, oldbr = cu->base_r;
     kvec_t(char) namespace = {0};
     kvec_t(size_t) namespace_lens = {0};
 
@@ -836,17 +909,18 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
             case DW_TAG_enumeration_type:
             case DW_TAG_typedef:
             case DW_TAG_base_type: {
+                const char *base = (node.flag & (1 << AFL_NAME)) ? node.at_name : "<?>";
                 char *name;
-                asprintf(&name, "%.*s%s", (int) namespace.n, namespace.a, node.at_name);
+                asprintf(&name, "%.*s%s", (int) namespace.n, namespace.a, base);
                 if(pass == 0) {
                     int _;
                     khiter_t k = kh_put(ccp, ec->name_map, offset, &_);
                     kh_value(ec->name_map, k) = name;
                 } else {
-                    struct reader oldr = cu->r;
+                    struct reader xoldr = cu->r;
                     if(!struct_die_to_json(ec, cu, &node, name))
                         free(name);
-                    cu->r = oldr;
+                    cu->r = xoldr;
                 }
                 // fall through
             }
@@ -865,13 +939,14 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
 
             // skip children
             if(node.flag & (1 << AFL_SIBLING)) {
-                cu->r = reader_slice_to_end(cu->full_r, node.at_sibling);
+                switch_to_dwarf_ref(cu, node.at_sibling);
             } else if(node.has_children) {
                 kv_push(size_t, namespace_lens, kv_size(namespace));
                 depth++;
             }
         }
         cu->r = oldr;
+        cu->base_r = oldbr;
     }
 
     ec->name_map_needs_mass_free = true;
@@ -987,7 +1062,7 @@ static void parse_debug_abbrev(struct reader r) {
                 case DW_FORM_ref8:
                 case DW_FORM_ref_sig8:
                 case DW_FORM_ref_udata:
-                //case DW_FORM_ref_addr:
+                case DW_FORM_ref_addr:
 
                 case DW_FORM_data1:
                 case DW_FORM_data2:
@@ -1043,7 +1118,7 @@ static void parse_debug_abbrev(struct reader r) {
                     case DW_FORM_ref8:
                     case DW_FORM_ref_sig8:
                     case DW_FORM_ref_udata:
-                    //case DW_FORM_ref_addr:
+                    case DW_FORM_ref_addr:
                         break;
                     default:
                         goto bad;
@@ -1102,6 +1177,7 @@ static void parse_debug_abbrev(struct reader r) {
                 }
 
                 ca.form = attr_form;
+                assert(attr_form);
 
                 kv_push(struct dwarf_cached_attr, cas, ca);
                 continue;
