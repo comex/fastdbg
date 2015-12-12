@@ -289,7 +289,7 @@ struct dwarf_abbr_cu {
     kvec_t(struct dwarf_abbr) abbrs;
 };
 
-typedef kvec_t(struct reader) cu_reader_vec;
+typedef kvec_t(struct cu_ctx) cu_vec_t;
 struct cu_ctx {
     struct reader full_r; // the entire CU
     struct reader r; // where we're reading now
@@ -301,7 +301,6 @@ struct cu_ctx {
     // debug_types
     uint64_t type_signature;
     uint64_t type_offset;
-    cu_reader_vec *sibling_vec;
 
 };
 
@@ -319,6 +318,9 @@ struct export_ctx {
 static khash_t(abbr_cu) dwarf_abbr_cus;
 static struct reader debug_str, debug_info;
 static struct reader debug_types, debug_abbrev, debug_pubtypes, debug_pubnames;
+
+static cu_vec_t debug_info_cus;//, debug_types_cus;
+
 static void *file_map;
 static size_t file_size;
 
@@ -340,29 +342,43 @@ static uint64_t read_addr(struct cu_ctx *cu) {
     return cu->addr_bytes == 8 ? read_t(uint64_t, &cu->r) : read_t(uint32_t, &cu->r);
 }
 
-static void switch_to_dwarf_ref(struct cu_ctx *cu, struct dwarf_ref ref) {
+static void switch_to_dwarf_ref(struct cu_ctx *restrict *cup, struct reader *oldrp, struct dwarf_ref ref) {
+    struct cu_ctx *cu = *cup;
     if (!ref.is_ref_addr) {
         cu->r = reader_slice_to_end(cu->full_r, ref.offset);
     } else {
-        cu->r = reader_slice_to_end(debug_info, ref.offset);
-        void *ptr = cu->r.ptr;
-        cu_reader_vec *v = cu->sibling_vec;
-        size_t lo = 0, hi = v->n - 1;
-        while(lo < hi) {
+        struct reader r = reader_slice_to_end(debug_info, ref.offset);
+        void *ptr = r.ptr;
+        cu_vec_t *v = &debug_info_cus;
+        assert(v->n);
+        ssize_t lo = 0, hi = v->n - 1;
+        while(lo <= hi) {
             size_t mid = (lo + hi) / 2;
-            struct reader r = v->a[mid];
-            if(ptr >= r.ptr && ptr < r.end) {
-                cu->full_r = 
+            //printf("%zu %zu %zu\n", lo, hi, mid);
+            struct cu_ctx *ocu = &v->a[mid];
+            struct reader s = ocu->full_r;
+            //printf("?    %p %p %p\n", ptr, r.ptr, r.end);
+            if(ptr >= s.ptr && ptr < s.end) {
+                if (oldrp) {
+                    cu->r = *oldrp;
+                    struct reader oldr = ocu->r;
+                    *oldrp = oldr;
+                }
+                ocu->r = r;
+                *cup = ocu;
                 return;
+            } else if (ptr < s.ptr) {
+                hi = mid - 1;
+            } else if (ptr >= s.end) {
+                lo = mid + 1;
+            } else {
+                assert(0);
             }
 
         }
-        assert(v);
-        assert(cu-
-            
-
+        panic("ref_addr target not found (lo=%zu hi=%zu, n=%zu)\n", lo, hi, v->n);
     }
-switch_to_dwarf_ref
+}
 inline struct reader slice_ref_to_end(const struct cu_ctx *cu, struct dwarf_ref offset) {
     struct reader base = offset.is_ref_addr ? debug_info : cu->full_r;
     return reader_slice_to_end(base, offset.offset);
@@ -558,45 +574,40 @@ static void parse_cu_header(struct cu_ctx *cu, struct reader *r) {
     cu->version = version;
     read_bytes(r, length - 2);
     cu->r = reader_slice_to_end(cu->full_r, 6);
-    cu->sibling_vec = NULL;
+    cu->acu = NULL;
 }
 
 static void parse_all_cus(struct reader r, void (*action)(struct cu_ctx *cu, void *context), void *context) {
-    struct reader oldr = r;
-    cu_reader_vec sibling_vec = {0};
     while(r.ptr != r.end) {
         struct cu_ctx cu;
         parse_cu_header(&cu, &r);
-        kv_push(struct reader, sibling_vec, cu.full_r);
-    }
-    r = oldr;
-    uint64_t i = 0;
-    while(r.ptr != r.end) {
-        if(i % 100 == 0)
-            fprintf(stderr, "[%llu/%llu]\n", i, sibling_vec.n);
-        i++;
-        struct cu_ctx cu;
-        parse_cu_header(&cu, &r);
-        cu.sibling_vec = &sibling_vec;
         action(&cu, context);
+    }
+}
+
+static void init_info_cu_vec(struct reader r, cu_vec_t *v) {
+    while(r.ptr != r.end) {
+        struct cu_ctx *cu = (kv_pushp(struct cu_ctx, *v));
+        parse_cu_header(cu, &r);
+        parse_debug_info_header(cu);
+        //printf(">> %p\n", cu.full_r.ptr);
     }
 }
 
 // also gets the size
 static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, struct dwarf_ref offset, bool *must_free_p, size_t *sizep) {
     // i should probably have a string library.
-    struct reader oldr = cu->r, oldbr = cu->base_r;
+    struct reader oldr = cu->r;
     kvec_t(char) prefix = {0}, suffix = {0};
     char *base = NULL;
     char *res;
     bool free_base = false;
     bool first = true;
     while(1) {
-        switch_to_dwarf_ref(cu, offset);
+        switch_to_dwarf_ref(&cu, &oldr, offset);
         struct dwarf_node node;
-        //printf("GFTY> %d\n", offset.is_ref_addr);
+        //printf("GFTY> %d %llu\n", offset.is_ref_addr, offset.offset);
         assert(parse_die(cu, &node));
-        //printf("<GFTY\n");
         if(first) {
             *sizep = (node.flag & (1 << AFL_BYTE_SIZE)) ? node.at_byte_size : -1;
             first = false;
@@ -697,7 +708,6 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, struc
     res = result.a;
 end:
     cu->r = oldr;
-    cu->base_r = oldbr;
     //printf("res=%s\n", res);
     return res;
 }
@@ -795,7 +805,7 @@ static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, const s
             }
 
             if(subnode.flag & (1 << AFL_SIBLING))
-                switch_to_dwarf_ref(cu, subnode.at_sibling);
+                switch_to_dwarf_ref(&cu, NULL, subnode.at_sibling);
         }
         tjson_list_end(tj);
         if(kv_size(vtable_elems)) {
@@ -840,7 +850,6 @@ static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool
     parse_cu_header(&debug_info_cu, &debug_info_r);
     parse_debug_info_header(&debug_info_cu);
     struct reader oldr = cu->r;
-    struct cu_rstate old = cu_get_rstate(cu);
 
 
     if(is_types) {
@@ -882,10 +891,9 @@ static void debug_pubtypes_cu_to_json(struct cu_ctx *cu, void *_ec) {
 
 static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     // basically, brute force
-    parse_debug_info_header(cu);
     struct export_ctx *ec = _ec;
     export_ctx_init_cu(ec);
-    struct reader oldr = cu->r, oldbr = cu->base_r;
+    struct reader oldr = cu->r;
     kvec_t(char) namespace = {0};
     kvec_t(size_t) namespace_lens = {0};
 
@@ -939,14 +947,13 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
 
             // skip children
             if(node.flag & (1 << AFL_SIBLING)) {
-                switch_to_dwarf_ref(cu, node.at_sibling);
+                switch_to_dwarf_ref(&cu, &oldr, node.at_sibling);
             } else if(node.has_children) {
                 kv_push(size_t, namespace_lens, kv_size(namespace));
                 depth++;
             }
         }
         cu->r = oldr;
-        cu->base_r = oldbr;
     }
 
     ec->name_map_needs_mass_free = true;
@@ -954,6 +961,16 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     kv_destroy(namespace_lens);
     export_ctx_destroy_cu(ec);
 }
+
+static void debug_info_each_cu_to_json(cu_vec_t *v, struct export_ctx *ec) {
+    size_t n = v->n;
+    for (size_t i = 0; i < n; i++) {
+        if(i % 100 == 0)
+            fprintf(stderr, "[%zu/%zu]\n", i, v->n);
+        debug_info_cu_to_json(&v->a[i], ec);
+    }
+}
+
 
 static void debug_info_cu_dump(struct cu_ctx *restrict cu, void *is_types) {
     parse_debug_info_header(cu);
@@ -1342,13 +1359,16 @@ int main(int argc, char **argv) {
         return 0;
     }
 
+    init_info_cu_vec(debug_info, &debug_info_cus);
+    //init_types_cu_vec(debug_types, &debug_types_cus);
+
     struct export_ctx ec;
     export_ctx_init(&ec, debug_info.end - debug_info.ptr);
     tjson_dict_start(&ec.tj);
     if(debug_pubtypes.ptr && 0) {
         parse_all_cus(debug_pubtypes, debug_pubtypes_cu_to_json, &ec);
     } else {
-        parse_all_cus(debug_info, debug_info_cu_to_json, &ec);
+        debug_info_each_cu_to_json(&debug_info_cus, &ec);
     }
     if(1 && debug_pubnames.ptr) { // xxx
         tjson_dict_key(&ec.tj, ".globals");
