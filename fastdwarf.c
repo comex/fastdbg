@@ -344,7 +344,7 @@ static uint64_t read_addr(struct cu_ctx *cu) {
 
 static void switch_to_dwarf_ref(struct cu_ctx *restrict *cup, struct reader *oldrp, struct dwarf_ref ref) {
     struct cu_ctx *cu = *cup;
-    if (!ref.is_ref_addr) {
+    if(!ref.is_ref_addr) {
         cu->r = reader_slice_to_end(cu->full_r, ref.offset);
     } else {
         struct reader r = reader_slice_to_end(debug_info, ref.offset);
@@ -359,7 +359,7 @@ static void switch_to_dwarf_ref(struct cu_ctx *restrict *cup, struct reader *old
             struct reader s = ocu->full_r;
             //printf("?    %p %p %p\n", ptr, r.ptr, r.end);
             if(ptr >= s.ptr && ptr < s.end) {
-                if (oldrp) {
+                if(oldrp) {
                     cu->r = *oldrp;
                     struct reader oldr = ocu->r;
                     *oldrp = oldr;
@@ -367,9 +367,9 @@ static void switch_to_dwarf_ref(struct cu_ctx *restrict *cup, struct reader *old
                 ocu->r = r;
                 *cup = ocu;
                 return;
-            } else if (ptr < s.ptr) {
+            } else if(ptr < s.ptr) {
                 hi = mid - 1;
-            } else if (ptr >= s.end) {
+            } else if(ptr >= s.end) {
                 lo = mid + 1;
             } else {
                 assert(0);
@@ -389,19 +389,12 @@ static void export_ctx_init(struct export_ctx *ec, size_t debug_info_size) {
     ec->seen = kh_init(strset);
     // a rough estimate to avoid rehashing
     kh_resize(strset, ec->seen, debug_info_size / 1500);
+    ec->name_map = kh_init(ccp);
 }
 
 static void export_ctx_destroy(struct export_ctx *ec) {
     kh_destroy(strset, ec->seen);
-}
-
-static void export_ctx_init_cu(struct export_ctx *ec) {
-    ec->name_map = kh_init(ccp);
-    ec->name_map_needs_mass_free = false;
-}
-
-static void export_ctx_destroy_cu(struct export_ctx *ec) {
-    if(ec->name_map_needs_mass_free) {
+    {
         // my hash table does this macro better.
         const char *name;
         kh_foreach_value(ec->name_map, name, free((char *) name));
@@ -607,16 +600,15 @@ static char *get_full_type_name(struct cu_ctx *cu, khash_t(ccp) *name_map, struc
         switch_to_dwarf_ref(&cu, &oldr, offset);
         struct dwarf_node node;
         //printf("GFTY> %d %llu\n", offset.is_ref_addr, offset.offset);
+        void *ptr = cu->r.ptr;
         assert(parse_die(cu, &node));
         if(first) {
             *sizep = (node.flag & (1 << AFL_BYTE_SIZE)) ? node.at_byte_size : -1;
             first = false;
         }
         if(!(node.flag & (1 << AFL_TYPE))) {
-            int64_t nmkey = offset.offset;
-            if (offset.is_ref_addr)
-                nmkey = -nmkey;
-            khiter_t k = kh_get(ccp, name_map, nmkey);
+            assert(ptr >= debug_info.ptr && ptr < debug_info.end);
+            khiter_t k = kh_get(ccp, name_map, ptr - debug_info.ptr);
             if(k != kh_end(name_map))
                 base = (char *) kh_value(name_map, k);
             if(node.flag & (1 << AFL_SPECIFICATION)) {
@@ -724,6 +716,19 @@ static uint64_t loc_to_offset(struct dwarf_location loc) {
     }
 }
 
+static void skip_node_children(struct cu_ctx *cu, const struct dwarf_node *node) {
+    int depth = node->has_children ? 1 : 0;
+    while(depth > 0) {
+        struct dwarf_node subnode;
+        if(!parse_die(cu, &subnode)) {
+            --depth;
+        } else {
+            if(subnode.has_children)
+                ++depth;
+        }
+    }
+}
+
 static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, const struct dwarf_node *node, const char *myname) {
     struct tjson *tj = &ec->tj;
     if(!(node->tag == DW_TAG_class_type || node->tag == DW_TAG_structure_type))
@@ -763,6 +768,8 @@ static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, const s
                 name = subnode.at_name;
             else
                 name = "<anon>";
+
+            //printf("?? name=%s tag=%s\n", name, dwarf_tag_name(subnode.tag));
 
             switch(subnode.tag) {
             case DW_TAG_member:
@@ -806,6 +813,8 @@ static bool struct_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, const s
 
             if(subnode.flag & (1 << AFL_SIBLING))
                 switch_to_dwarf_ref(&cu, NULL, subnode.at_sibling);
+            else
+                skip_node_children(cu, &subnode);
         }
         tjson_list_end(tj);
         if(kv_size(vtable_elems)) {
@@ -842,7 +851,6 @@ static void var_die_to_json(struct export_ctx *ec, struct cu_ctx *cu, struct dwa
 }
 
 static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool is_types) {
-    export_ctx_init_cu(ec);
     struct cu_ctx debug_info_cu;
     uint64_t debug_info_offset = read_fmtbits(cu);
     uint64_t debug_info_size = read_fmtbits(cu);
@@ -878,7 +886,6 @@ static void debug_pubx_cu_to_json(struct cu_ctx *cu, struct export_ctx *ec, bool
         else
             var_die_to_json(ec, &debug_info_cu, &node, myname.ptr);
     }
-    export_ctx_destroy_cu(ec);
 }
 
 static void debug_pubnames_cu_to_json(struct cu_ctx *cu, void *_ec) {
@@ -892,18 +899,17 @@ static void debug_pubtypes_cu_to_json(struct cu_ctx *cu, void *_ec) {
 static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     // basically, brute force
     struct export_ctx *ec = _ec;
-    export_ctx_init_cu(ec);
     struct reader oldr = cu->r;
     kvec_t(char) namespace = {0};
     kvec_t(size_t) namespace_lens = {0};
 
     // pass 0: fill in the names
     // pass 1: print
-    for (int pass = 0; pass <= 1; pass++) {
+    for(int pass = 0; pass <= 1; pass++) {
         int depth = 0;
         while(cu->r.ptr != cu->r.end) {
             struct dwarf_node node;
-            uint64_t offset = cu->r.ptr - cu->full_r.ptr;
+            void *ptr = cu->r.ptr;
             if(!parse_die(cu, &node)) {
                 assert(--depth >= 0);
                 namespace.n = kv_pop(namespace_lens);
@@ -920,9 +926,11 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
                 const char *base = (node.flag & (1 << AFL_NAME)) ? node.at_name : "<?>";
                 char *name;
                 asprintf(&name, "%.*s%s", (int) namespace.n, namespace.a, base);
+                //printf(">> %s\n", name);
                 if(pass == 0) {
                     int _;
-                    khiter_t k = kh_put(ccp, ec->name_map, offset, &_);
+                    assert(ptr >= debug_info.ptr && ptr < debug_info.end);
+                    khiter_t k = kh_put(ccp, ec->name_map, ptr - debug_info.ptr, &_);
                     kh_value(ec->name_map, k) = name;
                 } else {
                     struct reader xoldr = cu->r;
@@ -945,10 +953,13 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
                 break;
             }
 
+            /*
             // skip children
             if(node.flag & (1 << AFL_SIBLING)) {
                 switch_to_dwarf_ref(&cu, &oldr, node.at_sibling);
-            } else if(node.has_children) {
+            } else 
+            */
+            if(node.has_children) {
                 kv_push(size_t, namespace_lens, kv_size(namespace));
                 depth++;
             }
@@ -959,12 +970,11 @@ static void debug_info_cu_to_json(struct cu_ctx *restrict cu, void *_ec) {
     ec->name_map_needs_mass_free = true;
     kv_destroy(namespace);
     kv_destroy(namespace_lens);
-    export_ctx_destroy_cu(ec);
 }
 
 static void debug_info_each_cu_to_json(cu_vec_t *v, struct export_ctx *ec) {
     size_t n = v->n;
-    for (size_t i = 0; i < n; i++) {
+    for(size_t i = 0; i < n; i++) {
         if(i % 100 == 0)
             fprintf(stderr, "[%zu/%zu]\n", i, v->n);
         debug_info_cu_to_json(&v->a[i], ec);
